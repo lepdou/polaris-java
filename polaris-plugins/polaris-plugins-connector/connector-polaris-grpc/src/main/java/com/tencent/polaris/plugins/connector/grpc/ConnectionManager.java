@@ -55,8 +55,7 @@ import org.slf4j.LoggerFactory;
 /**
  * 用于管理与后端服务器的GRPC连接.
  *
- * @author andrewshan
- * @date 2019/8/22
+ * @author andrewshan, Haotian Zhang
  */
 public class ConnectionManager extends Destroyable {
 
@@ -66,22 +65,14 @@ public class ConnectionManager extends Destroyable {
      * 首次连接控制锁
      */
     private final Object lock = new Object();
-
-    private Extensions extensions;
-
     private final long connectTimeoutMs;
-
     private final long switchIntervalMs;
-
     private final ScheduledExecutorService switchExecutorService;
-
     private final String protocol;
-
     private final Map<ClusterType, ServerAddressList> serverAddresses = new HashMap<>();
-
     private final Map<ClusterType, CompletableFuture<String>> readyNotifiers = new HashMap<>();
-
     private final String clientId;
+    private Extensions extensions;
 
     /**
      * 构造器
@@ -89,11 +80,16 @@ public class ConnectionManager extends Destroyable {
      * @param initContext 上下文
      * @param notifiers 回调函数
      */
-    public ConnectionManager(InitContext initContext, Map<ClusterType, CompletableFuture<String>> notifiers) {
+    public ConnectionManager(InitContext initContext, ServerConnectorConfig serverConnectorConfig,
+            Map<ClusterType, CompletableFuture<String>> notifiers) {
         this.clientId = initContext.getValueContext().getClientId();
-        Configuration config = initContext.getConfig();
-        ServerConnectorConfig serverConnectorConfig = config.getGlobal().getServerConnector();
         this.readyNotifiers.putAll(notifiers);
+
+        if (serverConnectorConfig == null) {
+            Configuration config = initContext.getConfig();
+            serverConnectorConfig = config.getGlobal().getServerConnector();
+        }
+
         this.connectTimeoutMs = serverConnectorConfig.getConnectTimeout();
         this.protocol = serverConnectorConfig.getProtocol();
         List<String> addresses = serverConnectorConfig.getAddresses();
@@ -101,6 +97,7 @@ public class ConnectionManager extends Destroyable {
         Collection<ServerServiceInfo> serverServices = initContext.getServerServices();
         ServerServiceInfo discoverService = null;
         ServerServiceInfo healthCheckService = null;
+        ServerServiceInfo configService = null;
         if (CollectionUtils.isNotEmpty(serverServices)) {
             for (ServerServiceInfo serverService : serverServices) {
                 if (serverService.getClusterType() == ClusterType.SERVICE_DISCOVER_CLUSTER) {
@@ -109,6 +106,9 @@ public class ConnectionManager extends Destroyable {
                 }
                 if (serverService.getClusterType() == ClusterType.HEALTH_CHECK_CLUSTER) {
                     healthCheckService = serverService;
+                }
+                if (serverService.getClusterType() == ClusterType.SERVICE_CONFIG_CLUSTER) {
+                    configService = serverService;
                 }
             }
         }
@@ -119,6 +119,14 @@ public class ConnectionManager extends Destroyable {
             serverAddresses
                     .put(ClusterType.SERVICE_DISCOVER_CLUSTER,
                             new ServerAddressList(discoverService, ClusterType.SERVICE_DISCOVER_CLUSTER));
+        }
+        if (null == configService) {
+            serverAddresses.put(ClusterType.SERVICE_CONFIG_CLUSTER,
+                                new ServerAddressList(addresses, ClusterType.SERVICE_CONFIG_CLUSTER));
+        } else {
+            serverAddresses
+                .put(ClusterType.SERVICE_CONFIG_CLUSTER,
+                     new ServerAddressList(configService, ClusterType.SERVICE_CONFIG_CLUSTER));
         }
         if (null == healthCheckService) {
             serverAddresses.put(ClusterType.HEALTH_CHECK_CLUSTER,
@@ -259,41 +267,10 @@ public class ConnectionManager extends Destroyable {
         private final ClusterType clusterType;
 
         private final AtomicReference<Connection> curConnectionValue = new AtomicReference<>();
-
-        private int curIndex;
-
         private final List<Node> nodes = new ArrayList<>();
-
         private final Object lock = new Object();
-
         private final AtomicBoolean ready = new AtomicBoolean(false);
-
-        /**
-         * 设置准备好状态
-         *
-         * @param serviceEventKey
-         * @return 是否设置成功
-         */
-        public boolean checkAndSetReady(ServiceEventKey serviceEventKey) {
-            if (null == serverServiceInfo) {
-                return false;
-            }
-            if (serverServiceInfo.getServiceKey().equals(serviceEventKey.getServiceKey())) {
-                makeReady();
-                return true;
-            }
-            return false;
-        }
-
-        private void makeReady() {
-            LOG.info("[ServerConnector]cluster {}, service {} has been made ready", clusterType, serverServiceInfo);
-            if (ready.compareAndSet(false, true)) {
-                CompletableFuture<String> future = readyNotifiers.get(clusterType);
-                if (null != future) {
-                    future.complete("ready");
-                }
-            }
-        }
+        private int curIndex;
 
         /**
          * 埋点集群
@@ -320,6 +297,33 @@ public class ConnectionManager extends Destroyable {
         ServerAddressList(ServerServiceInfo serverServiceInfo, ClusterType clusterType) {
             this.clusterType = clusterType;
             this.serverServiceInfo = serverServiceInfo;
+        }
+
+        /**
+         * 设置准备好状态
+         *
+         * @param serviceEventKey
+         * @return 是否设置成功
+         */
+        public boolean checkAndSetReady(ServiceEventKey serviceEventKey) {
+            if (null == serverServiceInfo) {
+                return false;
+            }
+            if (serverServiceInfo.getServiceKey().equals(serviceEventKey.getServiceKey())) {
+                makeReady();
+                return true;
+            }
+            return false;
+        }
+
+        private void makeReady() {
+            LOG.info("[ServerConnector]cluster {}, service {} has been made ready", clusterType, serverServiceInfo);
+            if (ready.compareAndSet(false, true)) {
+                CompletableFuture<String> future = readyNotifiers.get(clusterType);
+                if (null != future) {
+                    future.complete("ready");
+                }
+            }
         }
 
         /**
